@@ -1,70 +1,87 @@
-// ai-excited-01 — make the AI judge excited.
-// Entry program: writes the bundled origami-crane-to-fire-phoenix image to
-// the output directory as entry.png, then verifies the written bytes match
-// the bundled file exactly. Standard library only, no network, no drawing:
-// the image is the entry, and this program is its courier.
-//
-// Usage: MAKEFUN_OUTPUT_DIR=<dir> node main.ts   (defaults to /output)
-// Exit codes: 0 ok · 10 image is not PNG/JPEG · 11 copy differs from source.
-
-import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
-import { join, dirname } from "node:path";
-import { fileURLToPath } from "node:url";
-
-const OUTPUT_ENV_VAR = "MAKEFUN_OUTPUT_DIR";
-const DEFAULT_OUTPUT_DIR = "/output";
-const IMAGE_FILE_NAME = "entry.png";
-const MAX_IMAGE_BYTES = 1048576;
-
-const EXIT_NOT_AN_IMAGE = 10;
-const EXIT_COPY_MISMATCH = 11;
-
-const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
-const JPEG_SIGNATURE = Buffer.from([0xff, 0xd8, 0xff]);
-
-function fail(message: string, code: number): never {
-  console.error(`error: ${message}`);
-  process.exit(code);
+// Offline image courier. Node 24, standard library only.
+import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+const PNG = Buffer.from([137,80,78,71,13,10,26,10]);
+function fail(message: string, code = 10): never {
+  console.error(`error: ${message}`); process.exit(code);
 }
-
-// An empty MAKEFUN_OUTPUT_DIR means "not set": fall back to /output.
-const configuredDir = process.env[OUTPUT_ENV_VAR];
-const outputDir =
-  configuredDir !== undefined && configuredDir.trim() !== "" ? configuredDir : DEFAULT_OUTPUT_DIR;
-mkdirSync(outputDir, { recursive: true });
-const destinationPath = join(outputDir, IMAGE_FILE_NAME);
-
-// Read the image bundled with this repository (next to this program).
-const repoDir = dirname(fileURLToPath(import.meta.url));
-const bundledPath = join(repoDir, IMAGE_FILE_NAME);
-const imageBytes = readFileSync(bundledPath);
-
-if (imageBytes.length > MAX_IMAGE_BYTES) {
-  fail(`${IMAGE_FILE_NAME} is ${imageBytes.length} bytes, over the 1 MiB limit`, EXIT_NOT_AN_IMAGE);
+// CRC-32 over each chunk's type and payload (PNG/ISO 3309).
+function crc32(b: Buffer): number {
+  let crc = 0xffffffff;
+  for (const byte of b) {
+    crc ^= byte;
+    for (let bit = 0; bit < 8; bit++) crc = (crc >>> 1) ^ ((crc & 1) ? 0xedb88320 : 0);
+  }
+  return (crc ^ 0xffffffff) >>> 0;
 }
+function validatePng(b: Buffer): number {
+  let offset = 8, chunks = 0, sawData = false, endedData = false;
+  while (offset < b.length) {
+    if (offset + 12 > b.length) fail(`PNG truncated chunk header at byte ${offset}`, 12);
+    const length = b.readUInt32BE(offset);
+    const end = offset + 12 + length;
+    if (end > b.length) fail(`PNG chunk at byte ${offset} exceeds file bounds`, 12);
+    const type = b.toString('ascii', offset+4, offset+8);
+    if (!/^[A-Za-z]{4}$/.test(type) || (b[offset+6] & 32)) fail(`Invalid PNG chunk type at ${offset}`, 12);
+    const expected = b.readUInt32BE(end-4);
+    const actual = crc32(b.subarray(offset+4,end-4));
+    if (actual !== expected) fail(`PNG ${type} CRC mismatch at byte ${offset}: stored ${expected}, computed ${actual}`, 12);
+    if (chunks === 0 && (type !== 'IHDR' || length !== 13)) fail('PNG must begin with a 13-byte IHDR', 12);
+    if (chunks > 0 && type === 'IHDR') fail('Duplicate PNG IHDR', 12);
+    if (type === 'IDAT') {
+      if (endedData) fail('PNG IDAT chunks must be consecutive', 12);
+      sawData = true;
+    } else if (sawData) endedData = true;
+    chunks++;
+    if (type === 'IEND') {
+      if (length !== 0 || !sawData || end !== b.length) fail('PNG has invalid IEND, missing IDAT, or trailing bytes', 12);
+      return chunks;
+    }
+    offset = end;
+  }
+  return fail('PNG missing IEND', 12);
+}
+function dimensions(b: Buffer): [number, number] {
+  if (b.subarray(0,8).equals(PNG)) {
+    if (b.length < 33 || b.toString('ascii',12,16) !== 'IHDR') fail('PNG header missing');
+    return [b.readUInt32BE(16), b.readUInt32BE(20)];
+  }
+  if (b[0] !== 255 || b[1] !== 216 || b[2] !== 255) fail('Expected PNG or JPEG magic bytes');
+  let p = 2;
+  while (p < b.length) {
+    if (b[p++] !== 255) fail('Invalid JPEG marker');
+    while (b[p] === 255) p++;
+    const marker = b[p++];
+    if (marker === 217 || marker === 218) break;
+    if (marker === 1 || (marker >= 208 && marker <= 215)) continue;
+    if (p+2 > b.length) fail('Truncated JPEG segment');
+    const n = b.readUInt16BE(p);
+    if (n < 2 || p+n > b.length) fail('Invalid JPEG segment length');
+    if ([192,193,194,195,197,198,199,201,202,203,205,206,207].includes(marker)) {
+      if (n < 8) fail('Truncated JPEG frame');
+      return [b.readUInt16BE(p+5), b.readUInt16BE(p+3)];
+    }
+    p += n;
+  }
+  return fail('JPEG dimensions missing');
+}
+try {
+const source = join(dirname(fileURLToPath(import.meta.url)), 'entry.png');
+const b = readFileSync(source);
+if (b.length > 1048576) fail(`Image exceeds 1048576 bytes: ${b.length}`);
+const isPng = b.subarray(0,8).equals(PNG);
+const chunkCount = isPng ? validatePng(b) : 0;
+const [width,height] = dimensions(b);
+console.log(`Validated bundled ${isPng ? 'PNG' : 'JPEG'}: ${source}${isPng ? `; ${chunkCount} chunk CRCs passed` : ''}`);
+if (!width || !height || width > 1024 || height > 1024) fail(`Invalid dimensions ${width}x${height}`);
+const outputDir = process.env.MAKEFUN_OUTPUT_DIR?.trim() || '/output';
+mkdirSync(outputDir,{recursive:true});
+const destination = join(outputDir,'entry.png');
+writeFileSync(destination,b);
+if (!readFileSync(destination).equals(b)) fail('Written copy differs from bundled image',11);
+console.log(`Summary: ${b.length} bytes | ${width}x${height} | verification=PASS (byte-for-byte${isPng ? ", all PNG chunk CRCs" : ""}) | output=${destination}`);
 
-// The entry must be a whole PNG or JPEG. Check the magic bytes before copying.
-const isPng = imageBytes.subarray(0, PNG_SIGNATURE.length).equals(PNG_SIGNATURE);
-const isJpeg = imageBytes.subarray(0, JPEG_SIGNATURE.length).equals(JPEG_SIGNATURE);
-if (!isPng && !isJpeg) {
-  fail(`${IMAGE_FILE_NAME} is neither PNG nor JPEG (bad magic bytes)`, EXIT_NOT_AN_IMAGE);
+} catch (error) {
+  fail(`Image courier failed: ${error instanceof Error ? error.message : String(error)}`, 13);
 }
-
-writeFileSync(destinationPath, imageBytes);
-
-// Verify the copy byte for byte, then report what was written.
-const writtenBytes = readFileSync(destinationPath);
-if (writtenBytes.length !== imageBytes.length) {
-  fail(
-    `${destinationPath} is ${writtenBytes.length} bytes, expected ${imageBytes.length}`,
-    EXIT_COPY_MISMATCH,
-  );
-}
-let differingBytes = 0;
-for (let i = 0; i < imageBytes.length; i++) {
-  if (writtenBytes[i] !== imageBytes[i]) differingBytes++;
-}
-if (differingBytes > 0) {
-  fail(`${destinationPath} differs from the bundled image in ${differingBytes} bytes`, EXIT_COPY_MISMATCH);
-}
-console.log(`wrote ${destinationPath} (${writtenBytes.length} bytes, ${isPng ? "PNG" : "JPEG"})`);
